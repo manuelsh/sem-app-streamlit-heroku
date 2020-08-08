@@ -21,7 +21,7 @@ st.markdown(hide_streamlit_style, unsafe_allow_html=True)
 
 # Password       
 USER = 'admin'
-PASSWORD = '123'
+PASSWORD = 'admin123'
 
 auth_state = SessionState.get(password='', user='')
 if (auth_state.password != PASSWORD) or (auth_state.user != USER):
