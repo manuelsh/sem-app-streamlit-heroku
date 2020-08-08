@@ -20,8 +20,8 @@ hide_streamlit_style = """
 st.markdown(hide_streamlit_style, unsafe_allow_html=True)
 
 # Password       
-USER = 'admin'
-PASSWORD = 'admin123'
+USER = 'adquity'
+PASSWORD = 'adquityp'
 
 auth_state = SessionState.get(password='', user='')
 if (auth_state.password != PASSWORD) or (auth_state.user != USER):
