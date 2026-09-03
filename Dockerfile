@@ -1,23 +1,16 @@
-FROM python:3.7
+FROM python:3.12-slim
 
-# streamlit-specific commands
-RUN mkdir -p /root/.streamlit
-RUN bash -c 'echo -e "\
-[general]\n\
-email = \"\"\n\
-" > /root/.streamlit/credentials.toml'
-RUN bash -c 'echo -e "\
-[server]\n\
-enableCORS = false\n\
-" > /root/.streamlit/config.toml'
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
 
 EXPOSE 8501
 
 WORKDIR /app
 
 COPY requirements.txt ./requirements.txt
-RUN pip3 install -r requirements.txt
+RUN python -m pip install --no-cache-dir --upgrade "pip==26.2.1" \
+    && python -m pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-CMD streamlit run AdquitySEM.py --server.port $PORT
+CMD ["sh", "-c", "exec streamlit run AdquitySEM.py --server.address=0.0.0.0 --server.port=${PORT:-8501}"]
