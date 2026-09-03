@@ -1,32 +1,34 @@
-import pandas as pd
 import numpy as np
-import re
-import streamlit as st
+from functools import lru_cache
 from num2words import num2words
-import string
+import snowballstemmer
+from stop_words import get_stop_words
 import unidecode
-import nltk
-nltk.download('stopwords')
-nltk.download('punkt')
-from nltk.corpus import stopwords
-from nltk.tokenize import word_tokenize
-from nltk.stem import PorterStemmer
-from nltk.stem.snowball import FrenchStemmer
-from nltk.stem import SnowballStemmer
 
 def convert_lower_case(data):
     return np.char.lower(data)
     
 
-def remove_stop_words(data , lenguage):
-    if lenguage == "French":
-        stop_words = stopwords.words('french')
-    if lenguage == "English":
-        stop_words = stopwords.words('english')
-    if lenguage == "Spanish":
-        stop_words = stopwords.words('spanish')
+LANGUAGES = {
+    "English": ("english", "english"),
+    "French": ("french", "french"),
+    "Spanish": ("spanish", "spanish"),
+}
 
-    words = word_tokenize(str(data))
+
+@lru_cache(maxsize=len(LANGUAGES))
+def _stop_words(lenguage):
+    try:
+        language, _ = LANGUAGES[lenguage]
+    except KeyError as error:
+        raise ValueError(f"Unsupported language: {lenguage!r}") from error
+    return frozenset(get_stop_words(language))
+
+
+def remove_stop_words(data, lenguage):
+    stop_words = _stop_words(lenguage)
+
+    words = str(data).split()
     new_text = ""
     for w in words:
         if w not in stop_words and len(w) > 1:
@@ -35,7 +37,7 @@ def remove_stop_words(data , lenguage):
 
 
 def remove_punctuation(data):
-    symbols = "!\"#$%&()*+-./:;<=>?@[\]^_`{|}~\n"
+    symbols = "!\"#$%&()*+-./:;<=>?@[\\]^_`{|}~\n"
     for i in range(len(symbols)):
         data = np.char.replace(data, symbols[i], ' ')
         data = np.char.replace(data, "  ", " ")
@@ -46,28 +48,24 @@ def remove_apostrophe(data):
     return np.char.replace(data, "'", "")
 
 
-def stemming(data ,lenguage):
-    if lenguage == "English" : 
-         stemmer= PorterStemmer()
-    if lenguage == "French" : 
-        stemmer = FrenchStemmer()
-    if lenguage == "Spanish" : 
-        stemmer =  SnowballStemmer('spanish')
+def stemming(data, lenguage):
+    try:
+        _, stemmer_language = LANGUAGES[lenguage]
+    except KeyError as error:
+        raise ValueError(f"Unsupported language: {lenguage!r}") from error
+    stemmer = snowballstemmer.stemmer(stemmer_language)
 
-    tokens = word_tokenize(str(data))
-    new_text = ""
-    for w in tokens:
-        new_text = new_text + " " + stemmer.stem(w)
-    return new_text
+    tokens = str(data).split()
+    return " " + " ".join(stemmer.stemWords(tokens)) if tokens else ""
 
 def convert_numbers(data):
-    tokens = word_tokenize(str(data))
+    tokens = str(data).split()
     new_text = ""
     for w in tokens:
         try:
             w = num2words(int(w))
-        except:
-            a = 0
+        except (TypeError, ValueError):
+            pass
         new_text = new_text + " " + w
     new_text = np.char.replace(new_text, "-", " ")
     return new_text

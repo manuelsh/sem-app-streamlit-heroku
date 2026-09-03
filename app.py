@@ -1,18 +1,35 @@
-import pandas as pd
-import numpy as np
-import time
-import streamlit as st
-from multiprocessing import  Pool
-from functools import partial
-import base64
-import re 
-import os
 import io
-import gc
+import time
+from functools import partial
+
+import pandas as pd
+import streamlit as st
 
 import SessionState
-from text_normalization import *
-from functions import *
+from functions import (
+    closest_embedding_indices,
+    create_embedding_parallel,
+    create_model,
+    load_data,
+    parallelize_on_rows,
+    pipeline,
+    show_df,
+)
+from text_normalization import preprocess
+
+
+def excel_bytes(dataframe, sheet_name):
+    output = io.BytesIO()
+    dataframe.to_excel(output, index=False, sheet_name=sheet_name)
+    return output.getvalue()
+
+
+def rows_with_text(dataframe, column):
+    values = dataframe[column].astype('string')
+    valid = values.notna() & values.str.strip().ne('')
+    result = dataframe.loc[valid].copy()
+    result[column] = values.loc[valid]
+    return result
 
 
 def main():
@@ -26,23 +43,38 @@ def main():
 
     if module_program == "Create Ad Groups":
         session_state = SessionState.get(name="", button_sent=False)
+        search_terms_df = None
+        keywords_column = None
+        model = None
 
 
         similarity_clusters = st.sidebar.slider("Choose Similarity threshold", 0.70, 0.99, 0.95)
-        number_of_clusters = st.sidebar.number_input("Enter the number of Ad groups you want: ",format='%i' , value = 10)
-        number_of_kw_per_adgroup = st.sidebar.number_input("Enter the maximum number of Keywords you want in an Adgroup : ",format='%i' , value = 10)
+        number_of_clusters = st.sidebar.number_input(
+            "Enter the number of Ad groups you want: ",
+            min_value=1,
+            value=10,
+            step=1,
+            format='%i',
+        )
+        number_of_kw_per_adgroup = st.sidebar.number_input(
+            "Enter the maximum number of Keywords you want in an Adgroup : ",
+            min_value=1,
+            value=10,
+            step=1,
+            format='%i',
+        )
 
 
 
 
 
-        uploaded_file = st.file_uploader("Choose a  file")
+        uploaded_file = st.file_uploader("Choose a file", type=["xlsx"])
         if uploaded_file is not None:
             search_terms_df = load_data(uploaded_file)
             search_terms_columns = search_terms_df.columns
             keywords_column = st.selectbox("Which columns has the keywords in the file", options = search_terms_columns)
             volumn_column = st.selectbox("Which columns has the volume/number of clicks in the file", options = search_terms_columns)
-            search_terms_df = search_terms_df.astype({keywords_column:"str"})
+            search_terms_df = rows_with_text(search_terms_df, keywords_column)
             search_terms_df = search_terms_df.sort_values(by = volumn_column , ascending = False )
             search_terms_df = search_terms_df.reset_index(drop=True)
             st.write("**File uploaded and read**")
@@ -53,7 +85,13 @@ def main():
                 st.write(search_terms_df)
             session_state.cut_dataset = st.checkbox('Cut dataset?')
             if session_state.cut_dataset:
-                len_dataset = st.number_input("Enter the maximum number of rows you want",format='%i' , value = 1000)
+                len_dataset = st.number_input(
+                    "Enter the maximum number of rows you want",
+                    min_value=1,
+                    value=1000,
+                    step=1,
+                    format='%i',
+                )
                 search_terms_df = search_terms_df[:len_dataset]
 
 
@@ -67,21 +105,28 @@ def main():
 
 
 
-            session_state.create_model = st.checkbox('Create Model?')
-            if session_state.create_model :
-                if uploaded_file is  None:
-                    st.warning('You have to upload a file first!')
-                else:
+        session_state.create_model = st.checkbox(
+            'Create Model?',
+            key="create_groups_model",
+            disabled=search_terms_df is None,
+        )
+        if session_state.create_model and search_terms_df is not None:
+            try:
+                with st.spinner("Training the model"):
                     model = create_model(search_terms_df, column = keywords_column )
-                    st.spinner("Training the model")
-                    st.write("Model trained")   
+                st.write("Model trained")
+            except (TypeError, ValueError, RuntimeError) as error:
+                st.error(f"The model could not be trained: {error}")
 
-
-        session_state.create_ad_groups_bool = st.checkbox('Create Ad Groups?')
-        if session_state.create_ad_groups_bool:
+        session_state.create_ad_groups_bool = st.checkbox(
+            'Create Ad Groups?', disabled=model is None
+        )
+        if session_state.create_ad_groups_bool and model is not None:
             st.write("**Creating campaign...**")
             start = time.time()
             results_output , rest_df_output = pipeline(dataset = search_terms_df ,
+                                                model=model,
+                                                keywords_column=keywords_column,
                                                 similarity_clusters = similarity_clusters,
                                                 number_of_clusters = int(number_of_clusters),
                                                     number_of_kw = int(number_of_kw_per_adgroup),
@@ -92,70 +137,48 @@ def main():
 
             session_state.show_results_bool = st.checkbox('Show dataframe of results')
             if session_state.show_results_bool:
-                show_df(results_output)
+                show_df(results_output, key="ad_group_result_columns")
 
-            session_state.download_data_bool = st.checkbox('Download Data?' , key = str(results_output))
+            session_state.download_data_bool = st.checkbox(
+                'Download Data?', key="download_ad_groups"
+            )
             if session_state.download_data_bool:
                 results_output = results_output.drop(columns='embedding_average') 
-                # results_output = results_output[[keywords_column,"Ad_group_name",volumn_column]]
-                towrite = io.BytesIO()
-                results_output.to_excel(towrite,index = False,  encoding = 'UTF-16',sheet_name='Ad_groups')  # write to BytesIO buffer
-                towrite.seek(0)  # reset pointer
-                encoded = base64.b64encode(towrite.read()).decode()  # encoded object
-                href = f'<a href="data:file/csv;base64,{encoded}" download ="Ad_groups.xlsx">Download Excel File</a> (right-click and save as &lt;some_name&gt;.csv)'
-                st.markdown(href, unsafe_allow_html=True)   
+                st.download_button(
+                    "Download Excel File",
+                    data=excel_bytes(results_output, 'Ad_groups'),
+                    file_name="Ad_groups.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                )
     
     if module_program == "Autobuilder":
+        ad_groups_df = None
+        search_terms_df = None
+        model = None
 
-        def parallelize_test(data, func, num_of_processes=12):
-            data_split = np.array_split(data, num_of_processes)
-            pool = Pool(num_of_processes)
-            data = pd.concat(pool.map(func, data_split))
-            pool.close()
-            pool.join()
-            return data
-
-        def run_on_subset_test(func, data_subset):
-        #     return data_subset.apply(func)
-            return func(data_subset)
-        @st.cache
-        def parallelize_on_rows_test(data, func, num_of_processes=12):
-            return parallelize_test(data, partial(run_on_subset_test, func), num_of_processes)
-
-
-        def ad_group_assignment(data_subset):
-
-            distancias = 1 - distance.cdist(data_subset['embedding_average'].tolist()
-                                                    , ad_groups_clusters_centers['embedding_average'].tolist()
-                                                        , 'cosine')
-
-            list_distances = distancias
-
-            index_sol =  [np.where(list_distance==max(list_distance))[0][0] for list_distance in list_distances]
-            del list_distances
-            gc.collect()
-            data_subset['test'] = np.array(index_sol)
-            return data_subset['test']
-
-        ad_groups_file = st.file_uploader("Upload Keywords and Ad groups file")
+        ad_groups_file = st.file_uploader(
+            "Upload Keywords and Ad groups file", type=["xlsx"]
+        )
         if ad_groups_file is not None:
             ad_groups_df = pd.read_excel(ad_groups_file) 
             ad_groups_columns = ad_groups_df.columns
             for column in ad_groups_columns:
-                ad_groups_df = ad_groups_df.astype({column:"str"})
+                ad_groups_df = ad_groups_df.astype({column:"string"})
                 ad_groups_df[column] = ad_groups_df[column].str.lower()
 
             st.write("**File uploaded and read**")
             if st.checkbox('Show ad groups file'):
                 st.write(ad_groups_df)
 
-        search_terms_file = st.file_uploader("Upload Search Terms file")
+        search_terms_file = st.file_uploader(
+            "Upload Search Terms file", type=["xlsx"]
+        )
         if search_terms_file is not None:
             search_terms_df = pd.read_excel(search_terms_file) 
             search_terms_df = search_terms_df
             search_terms_columns = search_terms_df.columns
             for column in search_terms_columns:
-                search_terms_df = search_terms_df.astype({column:"str"})
+                search_terms_df = search_terms_df.astype({column:"string"})
                 search_terms_df[column] = search_terms_df[column].str.lower()
 
             st.write("**File uploaded and read**")
@@ -172,39 +195,72 @@ def main():
             keywords_ad_groups_column = st.selectbox("Which columns has the keywords in the ad group file", options = ad_groups_columns)
             ad_groups_column = st.selectbox("Which columns has the ad groups in the ad group file", options = ad_groups_columns)
             search_term_column = st.selectbox("Which columns has the search terms in the search terms file", options = search_terms_columns)
+            ad_groups_df = rows_with_text(ad_groups_df, keywords_ad_groups_column)
+            ad_groups_df = rows_with_text(ad_groups_df, ad_groups_column)
+            search_terms_df = rows_with_text(search_terms_df, search_term_column)
             i1 = search_terms_df.set_index(search_term_column).index
             i2 = ad_groups_df.set_index(keywords_ad_groups_column).index
             search_terms_df = search_terms_df[~i1.isin(i2)]
-        create_model_bool = st.checkbox('Create Model?')
+        files_ready = search_terms_df is not None and ad_groups_df is not None
+        create_model_bool = st.checkbox(
+            'Create Model?', key="autobuilder_model", disabled=not files_ready
+        )
         if create_model_bool and ad_groups_file is not None and search_terms_file is not None:
-            model = create_model(ad_groups_df , column=keywords_ad_groups_column)
-            st.write("Model trained")
+            try:
+                with st.spinner("Training the model"):
+                    model = create_model(ad_groups_df, column=keywords_ad_groups_column)
+                st.write("Model trained")
+            except (TypeError, ValueError, RuntimeError) as error:
+                st.error(f"The model could not be trained: {error}")
 
 
-        assign_cluster_bool = st.checkbox('Assign clusters')
-        if assign_cluster_bool:
+        assign_cluster_bool = st.checkbox('Assign clusters', disabled=model is None)
+        if assign_cluster_bool and model is not None:
 
             clusters_names = ad_groups_df[ad_groups_column].unique()
             clusters_names_df = pd.DataFrame(clusters_names , columns = ['ad_group'])
 
 
-            search_terms_df = create_embedding_parallel(search_terms_df , column=search_term_column)
-            clusters_names_df = create_embedding_parallel(clusters_names_df , column='ad_group')
+            search_terms_df = create_embedding_parallel(
+                search_terms_df, column=search_term_column, model=model
+            )
+            clusters_names_df = create_embedding_parallel(
+                clusters_names_df, column='ad_group', model=model
+            )
             ad_groups_clusters_centers = clusters_names_df
-            search_terms_df['index'] = parallelize_on_rows_test(search_terms_df
-                                                               , ad_group_assignment)
-            search_terms_df['ad_group'] =  search_terms_df['index'].apply(lambda x: ad_groups_clusters_centers['ad_group'][x] )
-            search_terms_df
+            try:
+                search_terms_df['index'] = closest_embedding_indices(
+                    search_terms_df['embedding_average'].tolist(),
+                    ad_groups_clusters_centers['embedding_average'].tolist(),
+                )
+            except ValueError as error:
+                st.error(f"Search terms could not be assigned: {error}")
+            else:
+                invalid_embeddings = int((search_terms_df['index'] < 0).sum())
+                if invalid_embeddings:
+                    st.warning(
+                        f"{invalid_embeddings} search terms had invalid embeddings "
+                        "and could not be assigned."
+                    )
+                search_terms_df['ad_group'] = search_terms_df['index'].map(
+                    ad_groups_clusters_centers['ad_group']
+                )
+                st.dataframe(search_terms_df)
 
-        download_data = st.checkbox('Download Data' , key = "download_data")
-        if download_data:
-            towrite = io.BytesIO()
+        assignments_ready = (
+            search_terms_df is not None and 'ad_group' in search_terms_df.columns
+        )
+        download_data = st.checkbox(
+            'Download Data', key="download_data", disabled=not assignments_ready
+        )
+        if download_data and assignments_ready:
             results_to_save = search_terms_df.drop(columns=['embedding_average']) 
-            results_to_save.to_excel(towrite, sheet_name='search terms',index = False,  encoding = 'UTF-16')
-            towrite.seek(0)  # reset pointer
-            encoded = base64.b64encode(towrite.read()).decode()  # encoded object
-            href = f'<a href="data:file/csv;base64,{encoded}" download ="searches_terms_and_ad_groups.xlsx">Download Excel File</a>'
-            st.markdown(href, unsafe_allow_html=True)
+            st.download_button(
+                "Download Excel File",
+                data=excel_bytes(results_to_save, 'search terms'),
+                file_name="searches_terms_and_ad_groups.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
 
 #     if module_program == "Create Ad Groups - Exhaustive":
 #         session_state = SessionState.get(name="", button_sent=False)
@@ -579,4 +635,3 @@ def main():
 #             st.markdown(href, unsafe_allow_html=True)  
 
     #########----------------- AUTOBUILDER
-
